@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from tkinter import Tk, filedialog, messagebox
+from tkinter import Tk, filedialog, messagebox, ttk
 
 import openpyxl
 import pdfplumber
@@ -24,11 +24,19 @@ class IncomeTransaction:
     source_file: str
 
 
+@dataclass
+class UsageStats:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    calls: int = 0
+
+
 def select_folder() -> Path | None:
     root = Tk()
     root.withdraw()
     root.attributes("-topmost", True)
-    folder = filedialog.askdirectory(title="Select folder with bank statement PDFs")
+    folder = filedialog.askdirectory(title="Оберіть папку з PDF-виписками")
     root.destroy()
     if not folder:
         return None
@@ -43,7 +51,22 @@ def extract_pdf_text(pdf_path: Path) -> str:
     return "\n".join(chunks)
 
 
-def call_ai_extract_income(client: OpenAI, statement_text: str, source_file: str) -> list[IncomeTransaction]:
+def update_usage_stats(response, usage_stats: UsageStats) -> None:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    usage_stats.input_tokens += int(getattr(usage, "input_tokens", 0) or 0)
+    usage_stats.output_tokens += int(getattr(usage, "output_tokens", 0) or 0)
+    usage_stats.total_tokens += int(getattr(usage, "total_tokens", 0) or 0)
+    usage_stats.calls += 1
+
+
+def call_ai_extract_income(
+    client: OpenAI,
+    statement_text: str,
+    source_file: str,
+    usage_stats: UsageStats,
+) -> list[IncomeTransaction]:
     schema_instruction = {
         "type": "array",
         "items": {
@@ -87,6 +110,7 @@ Statement text:
             {"role": "user", "content": f"JSON schema: {json.dumps(schema_instruction)}"},
         ],
     )
+    update_usage_stats(response, usage_stats)
 
     raw = response.output_text.strip()
     data = json.loads(raw)
@@ -108,11 +132,11 @@ def quarter_for_date(dt: datetime) -> str:
     return f"Q{q} {dt.year}"
 
 
-def build_report(transactions: list[IncomeTransaction], out_path: Path) -> None:
+def build_report(transactions: list[IncomeTransaction], out_path: Path, usage_stats: UsageStats) -> None:
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "Selected Income"
-    ws.append(["Date", "Quarter", "Description", "Amount UAH", "Source PDF"])
+    ws.title = "Відібрані надходження"
+    ws.append(["Дата", "Квартал", "Опис", "Сума, грн", "PDF-файл"])
 
     for tx in sorted(transactions, key=lambda t: t.date):
         ws.append(
@@ -125,8 +149,8 @@ def build_report(transactions: list[IncomeTransaction], out_path: Path) -> None:
             ]
         )
 
-    summary = wb.create_sheet("Tax Summary")
-    summary.append(["Metric", "Value (UAH)"])
+    summary = wb.create_sheet("Підсумок податків")
+    summary.append(["Показник", "Значення (грн)"])
 
     by_quarter: dict[str, Decimal] = {}
     for tx in transactions:
@@ -140,7 +164,7 @@ def build_report(transactions: list[IncomeTransaction], out_path: Path) -> None:
 
     ytd = Decimal("0")
     summary.append(["", ""])
-    summary.append(["Quarter", "Eligible income"])
+    summary.append(["Квартал", "Оподатковуваний дохід"])
     for q in sorted_quarters:
         ytd += by_quarter[q]
         summary.append([q, float(by_quarter[q])])
@@ -149,19 +173,50 @@ def build_report(transactions: list[IncomeTransaction], out_path: Path) -> None:
     military_tax = ytd * Decimal("0.01")
 
     summary.append(["", ""])
-    summary.append(["Total eligible income (YTD)", float(ytd)])
-    summary.append(["Unified Tax 5%", float(unified_tax)])
-    summary.append(["Military tax 1%", float(military_tax)])
-    summary.append(["Group 3 income limit", float(GROUP3_LIMIT_UAH)])
-    summary.append(["Limit remaining", float(GROUP3_LIMIT_UAH - ytd)])
-    summary.append(["Limit exceeded", "YES" if ytd > GROUP3_LIMIT_UAH else "NO"])
+    summary.append(["Загальний дохід (YTD)", float(ytd)])
+    summary.append(["Єдиний податок 5%", float(unified_tax)])
+    summary.append(["Військовий збір 1%", float(military_tax)])
+    summary.append(["Ліміт доходу ФОП 3 групи", float(GROUP3_LIMIT_UAH)])
+    summary.append(["Залишок до ліміту", float(GROUP3_LIMIT_UAH - ytd)])
+    summary.append(["Ліміт перевищено", "ТАК" if ytd > GROUP3_LIMIT_UAH else "НІ"])
+
+    token_log = wb.create_sheet("Лог токенів")
+    token_log.append(["Метрика", "Значення"])
+    token_log.append(["Кількість API-викликів", usage_stats.calls])
+    token_log.append(["Вхідні токени", usage_stats.input_tokens])
+    token_log.append(["Вихідні токени", usage_stats.output_tokens])
+    token_log.append(["Усього токенів", usage_stats.total_tokens])
 
     wb.save(out_path)
 
 
+def create_progress_window(total_files: int) -> tuple[Tk, ttk.Label, ttk.Progressbar]:
+    window = Tk()
+    window.title("Обробка банківських виписок")
+    window.resizable(False, False)
+
+    status = ttk.Label(window, text="Підготовка до обробки...")
+    status.pack(padx=14, pady=(14, 10))
+
+    progress = ttk.Progressbar(window, length=420, maximum=max(1, total_files), mode="determinate")
+    progress.pack(padx=14, pady=(0, 14))
+    progress["value"] = 0
+
+    window.update_idletasks()
+    window.update()
+    return window, status, progress
+
+
+def set_progress(window: Tk, label: ttk.Label, progress: ttk.Progressbar, value: int, text: str) -> None:
+    progress["value"] = value
+    label.configure(text=text)
+    window.update_idletasks()
+    window.update()
+
+
 def main() -> None:
     if not os.getenv("OPENAI_API_KEY"):
-        messagebox.showerror("Configuration error", "OPENAI_API_KEY is not set.")
+        messagebox.showerror("Помилка конфігурації", "Змінна OPENAI_API_KEY не задана.")
         return
 
     folder = select_folder()
@@ -170,29 +225,65 @@ def main() -> None:
 
     pdfs = sorted(folder.glob("*.pdf"))
     if not pdfs:
-        messagebox.showwarning("No PDFs", "No PDF files found in selected folder.")
+        messagebox.showwarning("Немає PDF", "У вибраній папці не знайдено PDF-файлів.")
         return
 
     client = OpenAI()
+    usage_stats = UsageStats()
     all_transactions: list[IncomeTransaction] = []
 
-    for pdf in pdfs:
-        text = extract_pdf_text(pdf)
-        if not text.strip():
-            continue
-        txs = call_ai_extract_income(client, text, pdf.name)
-        all_transactions.extend(txs)
+    progress_window, status_label, progress_bar = create_progress_window(len(pdfs))
+    try:
+        for index, pdf in enumerate(pdfs, start=1):
+            set_progress(
+                progress_window,
+                status_label,
+                progress_bar,
+                index - 1,
+                f"Обробка {index}/{len(pdfs)}: читання {pdf.name}",
+            )
+            text = extract_pdf_text(pdf)
+            if not text.strip():
+                set_progress(
+                    progress_window,
+                    status_label,
+                    progress_bar,
+                    index,
+                    f"Пропущено порожній PDF: {pdf.name}",
+                )
+                continue
 
-    if not all_transactions:
-        messagebox.showwarning(
-            "No eligible income found",
-            "No eligible income transactions were extracted. Please review source PDFs.",
-        )
-        return
+            set_progress(
+                progress_window,
+                status_label,
+                progress_bar,
+                index - 1,
+                f"Обробка {index}/{len(pdfs)}: AI-аналіз {pdf.name}",
+            )
+            txs = call_ai_extract_income(client, text, pdf.name, usage_stats)
+            all_transactions.extend(txs)
+            set_progress(
+                progress_window,
+                status_label,
+                progress_bar,
+                index,
+                f"Завершено {index}/{len(pdfs)}: {pdf.name}",
+            )
 
-    output_path = folder / "tax_report.xlsx"
-    build_report(all_transactions, output_path)
-    messagebox.showinfo("Done", f"Report generated:\n{output_path}")
+        if not all_transactions:
+            messagebox.showwarning(
+                "Надходження не знайдено",
+                "Оподатковувані надходження не виявлено. Перевірте PDF-файли.",
+            )
+            return
+
+        set_progress(progress_window, status_label, progress_bar, len(pdfs), "Формування Excel-звіту...")
+        output_path = folder / "tax_report.xlsx"
+        build_report(all_transactions, output_path, usage_stats)
+        set_progress(progress_window, status_label, progress_bar, len(pdfs), "Готово")
+        messagebox.showinfo("Готово", f"Звіт сформовано:\n{output_path}")
+    finally:
+        progress_window.destroy()
 
 
 if __name__ == "__main__":

@@ -18,7 +18,8 @@ A desktop-first Python app that can be packaged into a Windows `.exe`.
    - H1 = Q1 + Q2
    - 9M = Q1 + Q2 + Q3
    - 12M = Q1 + Q2 + Q3 + Q4
-7. Exports a user-friendly Excel report.
+7. Exports a user-friendly Excel report in Ukrainian with separate sheets for selected income, tax summary, and token usage log.
+8. Shows a local progress window (file-by-file status + progress bar) during processing.
 
 ---
 
